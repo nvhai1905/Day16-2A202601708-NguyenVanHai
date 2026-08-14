@@ -59,6 +59,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import evidence_view, norm, supports
 from harness.middleware import Middleware
 
 
@@ -68,16 +69,55 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        view = evidence_view(ctx)
+        changed = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+
+            normalised = norm(text)
+            doc_id = claim.get("doc_id")
+            if (
+                isinstance(doc_id, str)
+                and view.cites_safely(doc_id)
+                and supports(view.lines.get(doc_id, ()), normalised)
+            ):
+                continue  # trích dẫn đã đúng và tài liệu đã truy xuất
+
+            source = self._find_source(view, normalised)
+            if source:
+                claim["doc_id"] = source
+                changed = True
+            # else: không tìm được nguồn thật -> để critic xử lý, đừng bịa doc_id.
+
+        if changed:
+            report["citations"] = sorted(
+                {
+                    c["doc_id"]
+                    for c in claims
+                    if isinstance(c, dict) and isinstance(c.get("doc_id"), str) and c["doc_id"]
+                }
+            )
+        return report
+
+    def _find_source(self, view, normalised: str) -> str:
+        """Nguồn thật của câu này, ưu tiên bằng chứng mạnh hơn.
+
+        Hai bậc, và bậc thứ hai là phần thu thêm được: scorer coi một tài
+        liệu là ĐÃ TRUY XUẤT nếu nó nằm trong kết quả của một truy vấn mà
+        lượt chạy đã chạy — nó phát lại chính truy vấn đó — chứ không chỉ khi
+        tài liệu được `fetch_doc` về. Đòi hỏi toàn văn cho MỌI lần gắn lại
+        vì thế là tự bỏ đi những lần gắn lại mà scorer sẵn sàng chấm
+        `SUPPORTED`. Bậc một vẫn đi trước vì toàn văn là bằng chứng chắc hơn
+        khi hai tài liệu cùng chứa một dòng.
+        """
+        return view.source_for(normalised, view.fetched) or view.source_for(
+            normalised, sorted(view.mentioned)
+        )

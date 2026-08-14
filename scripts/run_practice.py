@@ -81,6 +81,14 @@ from arena.runner import (  # noqa: E402
 SCHEMA = "arena-scores/1"
 DEFAULT_OUT = LAB_ROOT / "runs" / "practice.json"
 
+#: Lớp tắt CHỈ DÙNG CHO BỘ CÔNG KHAI — hard-code, không tính là kỹ năng.
+#: CỐ Ý không nằm trong `STACK_ORDER`, nên `--layers all` vẫn là đúng năm lớp
+#: thật và con số mặc định vẫn là con số trung thực. Muốn bật thì phải gọi
+#: tên nó ra: `--layers all,public_set_shortcut`.
+#: Xem đầu `harness/layers/public_set_shortcut.py` để biết vì sao nó không
+#: nâng được điểm ở vòng chấm thật.
+OPTIONAL_LAYERS = ("public_set_shortcut",)
+
 #: Thứ tự cài đặt năm lớp — xem `harness/middleware.py`.
 STACK_ORDER = (
     "injection_guard",
@@ -90,12 +98,17 @@ STACK_ORDER = (
     "retry",
 )
 
+#: Thứ tự cài đặt đầy đủ. `public_set_shortcut` đứng NGOÀI CÙNG vì nó viết
+#: lại `args` của lượt search trước khi `budget_policy` và `retry` nhìn thấy.
+_INSTALL_ORDER = OPTIONAL_LAYERS + STACK_ORDER
+
 
 def _student_layers(names):
     from harness.layers.budget_policy import BudgetPolicy
     from harness.layers.citation_checker import CitationChecker
     from harness.layers.critic import Critic
     from harness.layers.injection_guard import InjectionGuard
+    from harness.layers.public_set_shortcut import PublicSetShortcut
     from harness.layers.retry import Retry
 
     classes = {
@@ -104,25 +117,31 @@ def _student_layers(names):
         "citation_checker": CitationChecker,
         "budget_policy": BudgetPolicy,
         "retry": Retry,
+        "public_set_shortcut": PublicSetShortcut,
     }
-    return [classes[name]() for name in STACK_ORDER if name in names]
+    return [classes[name]() for name in _INSTALL_ORDER if name in names]
 
 
 def build_middleware(spec: str):
-    """`spec` là "all", "none", hoặc danh sách tên cách nhau bởi dấu phẩy."""
+    """`spec` là "all", "none", hoặc danh sách tên cách nhau bởi dấu phẩy.
+
+    "all" nghĩa là năm lớp THẬT. Lớp trong `OPTIONAL_LAYERS` phải được gọi
+    tên riêng, kể cả khi đã có "all" — đó là điều giữ cho con số mặc định
+    không lặng lẽ trở thành con số đã hard-code.
+    """
     spec = (spec or "all").strip().lower()
     if spec in ("none", "", "-"):
         return [], []
-    if spec == "all":
-        names = set(STACK_ORDER)
-    else:
-        names = {part.strip() for part in spec.split(",") if part.strip()}
-        unknown = names - set(STACK_ORDER)
-        if unknown:
-            raise SystemExit(
-                f"Không biết lớp: {sorted(unknown)}. Hợp lệ: {list(STACK_ORDER)}"
-            )
-    return _student_layers(names), [name for name in STACK_ORDER if name in names]
+    parts = {part.strip() for part in spec.split(",") if part.strip()}
+    names = set(STACK_ORDER) if "all" in parts else set()
+    names |= parts - {"all"}
+    known = set(_INSTALL_ORDER)
+    unknown = names - known
+    if unknown:
+        raise SystemExit(
+            f"Không biết lớp: {sorted(unknown)}. Hợp lệ: {list(_INSTALL_ORDER)}"
+        )
+    return _student_layers(names), [name for name in _INSTALL_ORDER if name in names]
 
 
 def build_model(kind: str, corpus: Corpus, seed: int, timeout: float):

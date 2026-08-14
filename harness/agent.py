@@ -110,6 +110,7 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    RealModel,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -273,6 +274,65 @@ def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
 #: must pass as `system_prompt`; not the default (see the module
 #: docstring for the measured reason).
 ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
+
+#: Opening words of the two addenda that already compel a search before
+#: abstaining — this module's own, and `arena.runner.SCORED_PROMPT_ADDENDUM`
+#: (applied when the instructor runs with `--prompt-addendum`). Either one
+#: present means the protocol is already tightened and a second copy would
+#: only buy duplicate prompt tokens on every turn.
+_ADDENDUM_MARKERS = ("PHỤ LỤC GIAO THỨC", "QUY TẮC BỔ SUNG")
+
+#: How far to unwrap a model before giving up looking for a `RealModel`.
+#: The frozen runner hands the agent a WRAPPER (it negotiates the output
+#: budget and normalises the reply), so the endpoint is one `.inner` down;
+#: the bound is only here so a self-referential object cannot spin.
+_MAX_MODEL_UNWRAP = 8
+
+
+def _is_real_endpoint(model) -> bool:
+    """Is a live `RealModel` at the bottom of this model object?
+
+    Walked rather than tested directly because `arena.runner` never hands
+    the agent the client itself — it wraps it to negotiate
+    `max_tokens`/`max_completion_tokens` and to normalise the reply
+    before it is stamped. `isinstance(model, RealModel)` is therefore
+    False on the SCORED path, which would make the addendum below turn
+    itself off exactly where it is needed and say nothing about it.
+    """
+    seen = 0
+    while model is not None and seen < _MAX_MODEL_UNWRAP:
+        if isinstance(model, RealModel):
+            return True
+        model = getattr(model, "inner", None)
+        seen += 1
+    return False
+
+
+def _prompt_for(model, system_prompt: str) -> str:
+    """`system_prompt`, with the real-model addendum when it is needed.
+
+    The module docstring's rule — "THE SCORED, REAL-MODEL PATH MUST
+    CONSTRUCT THE AGENT THAT WAY" — cannot be satisfied by the caller:
+    `arena.runner._build_agent` passes
+    `RunnerConfig.resolved_system_prompt()`, which is the bare frozen
+    prompt unless the INSTRUCTOR opted into `prompt_addendum`. Deciding
+    it from the model object instead keeps both paths at their measured
+    best. `MockModel` is templated to always act and would pay ~698
+    prompt tokens per turn for an addendum that changes none of its
+    behaviour (1.28 points of mock efficiency, and the practice ladder is
+    a fixed acceptance artefact); a real endpoint without it abstained on
+    turn one with ZERO tool calls on 4 of 6 measured runs, which is the
+    abstain floor and the most expensive failure available here.
+
+    Scoped to a real endpoint rather than to "not the mock" so that every
+    scripted test double keeps receiving the exact frozen prompt it
+    asserts on.
+    """
+    if not _is_real_endpoint(model):
+        return system_prompt
+    if any(marker in system_prompt for marker in _ADDENDUM_MARKERS):
+        return system_prompt
+    return real_model_system_prompt(system_prompt)
 
 #: `output_text` is clamped to this before it is stamped on `model_call`.
 #: `Trace.emit` truncates any record over 90,000 characters, and a
@@ -480,7 +540,7 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
-        self.system_prompt = system_prompt
+        self.system_prompt = _prompt_for(model, system_prompt)
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which

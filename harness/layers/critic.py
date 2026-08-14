@@ -70,7 +70,19 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import (
+    MAX_CLAIM_CHARS,
+    evidence_view,
+    norm,
+    quotes_any_document,
+)
 from harness.middleware import Middleware
+
+#: Liên từ mà `MockModel` dùng để dán hai nửa câu mâu thuẫn lại với nhau.
+_FUSE_SEP = " và "
+
+#: Không đủ căn cứ sau khi mọi claim đều bị xoá.
+_ABSTAIN_ANSWER = "Không đủ căn cứ trong tài liệu để trả lời câu hỏi này."
 
 
 class Critic(Middleware):
@@ -79,16 +91,70 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        view = evidence_view(ctx)
+        kept: list[dict] = []
+        split_any = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            normalised = norm(text)
+            # Quá dài thì scorer chấm `OVERLONG`: phạt trọn một claim VÀ
+            # không mang lại chút recall nào (verdict đó không giữ text, nên
+            # không fact nào tính là đã nêu). Bỏ đi là thắng thuần tuý.
+            if len(normalised) > MAX_CLAIM_CHARS:
+                continue
+            if quotes_any_document(view.lines, normalised):
+                kept.append(claim)
+                continue
+            split = self._split_fused(view, text)
+            if split is not None:
+                kept.extend(split)
+                split_any = True
+            # else: không tài liệu nào nói câu này -> bịa, bỏ claim.
+
+        if split_any:
+            report["abstain"] = True
+
+        if not kept:
+            report["claims"] = []
+            report["citations"] = []
+            report["abstain"] = True
+            report["answer"] = _ABSTAIN_ANSWER
+            return report
+
+        report["claims"] = kept
+        report["citations"] = sorted(
+            {c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str) and c["doc_id"]}
+        )
+        return report
+
+    def _split_fused(self, view, text: str):
+        """Thử mọi vị trí `" và "` trong `text`; giữ vị trí mà cả hai nửa đều
+        khớp nguyên văn một dòng của HAI tài liệu khác nhau đã đọc TOÀN VĂN.
+
+        Đòi hỏi toàn văn (`view.fetched`) chứ không phải chỉ mã tài liệu: hai
+        nửa được gắn `doc_id` mới, nên chúng phải trỏ về nguồn mà lượt chạy
+        thật sự đọc được chứ không phải một tài liệu mới thấy tên.
+        """
+        start = 0
+        while True:
+            idx = text.find(_FUSE_SEP, start)
+            if idx == -1:
+                return None
+            first, second = text[:idx].strip(), text[idx + len(_FUSE_SEP):].strip()
+            if first and second:
+                first_id = view.source_for(norm(first), view.fetched)
+                second_id = view.source_for(norm(second), view.fetched)
+                if first_id and second_id and first_id != second_id:
+                    return [
+                        {"text": first, "doc_id": first_id},
+                        {"text": second, "doc_id": second_id},
+                    ]
+            start = idx + 1
